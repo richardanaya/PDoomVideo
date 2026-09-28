@@ -26,9 +26,15 @@ function pdoomAt(t) {
 // Standalone loops (GIFs, not part of the video): window.LOOP = LOOPS[name] swaps the whole frame for that scene,
 // with no karaoke, meter or wipes. t is then loop time, not song time.
 const LOOPS = {};
+// Alternate cuts (short edits like the test hook): cut(name, start, end, shots) registers a standalone chapter over a song
+// range. window.CUT = CUTS[name] makes drawWorld paint only that cut, still in song time so the audio slice stays in sync,
+// with no karaoke, corner meter or wipes (a cut carries its own lyric typography).
+const CUTS = {};
+function cut(name, start, end, shots) { CUTS[name] = { name, start, end, shots }; }
 function drawWorld(t) {
   if (window.LOOP) { window.LOOP(t); flushLetters(); return; }
-  const ch = CH.find(c => t >= c.start && t < c.end);
+  const C = window.CUT;
+  const ch = C ? (t >= C.start && t < C.end ? C : null) : CH.find(c => t >= c.start && t < c.end);
   if (!ch) placeholder(t);
   else {
     let i = 0; while (i + 1 < ch.shots.length && t >= ch.shots[i + 1][0]) i++;
@@ -37,6 +43,7 @@ function drawWorld(t) {
     CAM = null;
   }
   flushLetters();
+  if (C) return;
   if (!METER_SHOWN) { cornerMeter(t); flushLetters(); }
   WIPES.forEach((b, j) => { if (Math.abs(t - b) < WIPE_TR) wipe((t - (b - WIPE_TR)) / (2 * WIPE_TR), j); });
   karaoke(t);
