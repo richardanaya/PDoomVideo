@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>P(doom) studio</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Permanent+Marker&family=Shantell+Sans:wght@800&display=block">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Anton&family=Permanent+Marker&family=Shantell+Sans:wght@800&display=block">
 <style>
   html, body { margin: 0; background: #1b1820; color: #eee; font: 13px system-ui, sans-serif; }
   main { padding: 12px; display: grid; gap: 8px; }
@@ -37,5 +37,7 @@
 <script src="src/ch/c07_scale.js"></script>
 <script src="src/ch/c08_chorus4.js"></script>
 <script src="src/ch/c09_finale.js"></script>
+<script src="src/ch/test_hook.js"></script>
+<script>{ const c = new URLSearchParams(location.search).get('cut'); if (c) window.CUT = CUTS[c]; }  // e.g. studio.html?cut=test_hook&t=24</script>
 </body>
 </html>
