@@ -5,6 +5,8 @@
 //   node render.mjs --frames=0:156.6 --workers=4                                full-res JPEG frames → out/frames (resumable)
 //   node render.mjs --encode [--out=out/pdoom.mp4]                               frames + song → MP4
 //   node render.mjs --loop=recursion [--out=out/loop_recursion]                 one cycle of a standalone loop (PNGs)
+//   node render.mjs --cut=test_hook --workers=3 --out=artifacts/test_hook.mp4  a registered cut (its own range + audio slice)
+//   (--cut also works with --sheet/--stills; --workers parallelises --clip/--cut; --chrome=<path>, --gl=<angle backend>)
 //   (--loop also works with --sheet, where the times are loop time)
 import puppeteer from 'puppeteer-core';
 import { spawn } from 'node:child_process';
@@ -13,7 +15,12 @@ import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const args = Object.fromEntries(process.argv.slice(2).map(a => { const [k, v] = a.replace(/^--/, '').split('='); return [k, v ?? true]; }));
-const CHROME = args.chrome || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
+const WIN = process.platform === 'win32';
+const CHROME = args.chrome || (WIN ? 'C:/Program Files/Google/Chrome/Application/chrome.exe'
+  : process.platform === 'darwin' ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : '/usr/bin/google-chrome');
+// ANGLE backend: d3d11 on Windows; elsewhere desktop GL (on a GPU-less Linux VM that is Mesa llvmpipe, ~5x faster than
+// SwiftShader). Override with --gl=swiftshader|vulkan|...
+const GL = args.gl || (WIN ? 'd3d11' : 'gl');
 const DUR = 156.6, fps = +(args.fps || 24);
 const FRAMES_DIR = 'out/frames';
 
@@ -31,7 +38,8 @@ if (args.encode) {
 
 const browser = await puppeteer.launch({
   executablePath: CHROME, headless: true, protocolTimeout: 0,
-  args: ['--allow-file-access-from-files', '--ignore-gpu-blocklist', '--use-angle=d3d11', '--enable-gpu-rasterization', '--window-size=1920,1080', '--disable-renderer-backgrounding', '--disable-background-timer-throttling']
+  args: ['--allow-file-access-from-files', '--ignore-gpu-blocklist', `--use-angle=${GL}`, ...(GL === 'swiftshader' ? ['--enable-unsafe-swiftshader'] : GL === 'gl' ? ['--use-gl=angle'] : []),
+    '--enable-gpu-rasterization', '--window-size=1920,1080', '--disable-renderer-backgrounding', '--disable-background-timer-throttling']
 });
 async function openPage(tag = '') {
   const page = await browser.newPage();
@@ -40,6 +48,7 @@ async function openPage(tag = '') {
   await page.goto(pathToFileURL(resolve('studio.html')).href + '?render', { waitUntil: 'networkidle0' });
   await page.waitForFunction('window.ready === true', { timeout: 60000 });
   if (args.loop) await page.evaluate(name => { window.LOOP = LOOPS[name]; }, args.loop);
+  if (args.cut && !await page.evaluate(name => !!(window.CUT = CUTS[name]), args.cut)) throw new Error('unknown cut: ' + args.cut);
   return page;
 }
 const frameOf = async (page, t, type, q) => {
@@ -94,20 +103,33 @@ if (args.sheet) {
   };
   await Promise.all(Array.from({ length: workers }, (_, w) => work(w)));
 } else {
-  const page = await openPage();
-  const [a, b] = args.clip ? String(args.clip).split(':').map(Number) : [0, DUR];
+  // --workers=N renders frames on N pages in parallel; they are still piped to ffmpeg strictly in order.
+  const pages = await Promise.all(Array.from({ length: +(args.workers || 1) }, (_, w) => openPage('#' + w)));
+  const [a, b] = args.clip ? String(args.clip).split(':').map(Number) : args.cut ? await pages[0].evaluate(() => [window.CUT.start, window.CUT.end]) : [0, DUR];
   const out = args.out || 'out/clip.mp4'; mkdirSync(dirname(out), { recursive: true });
+  // cuts are standalone edits, so ease the audio in and out instead of hard-clipping the song
+  const fade = args.cut ? ['-af', `afade=t=in:d=0.04,afade=t=out:st=${(b - a - .35).toFixed(3)}:d=0.35`] : [];
   const ff = spawn('ffmpeg', ['-y', '-loglevel', 'error', '-f', 'image2pipe', '-framerate', String(fps), '-c:v', 'mjpeg', '-i', '-',
     '-ss', String(a), '-t', String(b - a), '-i', 'assets/pdoom.mp3',
-    '-map', '0:v', '-map', '1:a', '-c:v', 'libx264', '-preset', 'medium', '-crf', '19', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-shortest', out],
+    '-map', '0:v', '-map', '1:a', '-c:v', 'libx264', '-preset', 'medium', '-crf', '19', '-pix_fmt', 'yuv420p', ...fade, '-c:a', 'aac', '-b:a', '192k',
+    '-movflags', '+faststart', '-shortest', out],
     { stdio: ['pipe', 'inherit', 'inherit'] });
-  const n = Math.round((b - a) * fps), start = Date.now();
+  const n = Math.round((b - a) * fps), start = Date.now(), ready = new Map(), waiting = new Map();
+  let next = 0;
+  pages.forEach(async page => {
+    while (next < n) {
+      const i = next++;
+      ready.set(i, await frameOf(page, a + i / fps, 'image/jpeg', .92));
+      waiting.get(i)?.();
+    }
+  });
   for (let i = 0; i < n; i++) {
-    const buf = await frameOf(page, a + i / fps, 'image/jpeg', .92);
+    if (!ready.has(i)) await new Promise(r => waiting.set(i, r));
+    const buf = ready.get(i); ready.delete(i); waiting.delete(i);
     if (!ff.stdin.write(buf)) await new Promise(r => ff.stdin.once('drain', r));
-    if (i % 24 === 0 || i === n - 1) console.log(`frame ${i + 1}/${n}  ${((Date.now() - start) / (i + 1)).toFixed(0)} ms/frame`);
+    if (i % 24 === 0 || i === n - 1) console.log(`frame ${i + 1}/${n}  ${((Date.now() - start) / (i + 1)).toFixed(0)} ms/frame effective`);
   }
   ff.stdin.end(); await new Promise(r => ff.on('close', r));
-  console.log(`wrote ${out}`);
+  console.log(`wrote ${out}  (${n} frames, ${(n / fps).toFixed(2)} s)`);
 }
 await browser.close();
